@@ -34,6 +34,46 @@ DLSSNR-Video 在 Linux 上把 DLSS5 神经渲染用于**浏览器视频**。它�
 DLSSNR_ALLOW_OVERLAY=1          在 Steam 的辅助进程中保持该层启用
 ```
 
+## 浏览器视频（快速开始）
+
+浏览器路径使用与游戏路径不同的配置文件、层清单和共享内存文件。请通过
+`~/.local/bin/dlss5-chrome`（本机上的 *Google Chrome* 桌面项）启动视频版 Chrome，或用
+`~/.local/bin/dlss5-firefox-temp` 启动适配 snap 的 Firefox。Chrome 会使用独立配置文件、
+ANGLE/Vulkan 呈现路径并启用视频层；层库和原生消息主机都来自本仓库。
+
+把 [`browser-extension/chrome/`](browser-extension/chrome/) 作为解压扩展加载
+（`chrome://extensions` → 开发者模式 → 加载已解压的扩展程序），或把
+[`browser-extension/firefox/`](browser-extension/firefox/) 作为临时附加组件加载。
+原生消息主机是 `browser-extension/host/dlssnr_bridge.py`（`com.dlssnr.bridge`）；Firefox 下
+相同的命令经由 `127.0.0.1:8765` 上的本地回环守护进程传递。
+
+**激活基于点击。** 在点击工具栏图标（或按 `Alt+Shift+D`）之前，页面不会发生任何事情。
+点击后该标签页进入“已激活”状态：面板打开，视频门控开始工作。再次点击图标、再次按下快捷键，
+或点击面板的 **×** 都会取消激活并关闭增强。激活只对当前页面有效 —— 完整导航、关闭标签页或
+重启浏览器都会清除它。从未点击过的网站完全 inert：没有面板、没有状态上报、没有 ROI、
+没有自动配置档，也不会增强，即使它正在播放视频。
+
+**自动网站。** 打开扩展选项（`chrome://extensions` → 详情 → *扩展程序选项*，或面板中的 ⚙ 按钮）
+可以把某些网站加入白名单，使其在加载时自动激活。规则可以是主机名（`youtube.com`，`www` 可省略）、
+主机及子域名（`*.netflix.com`）、主机 + 路径前缀（`example.com/watch`），或者完整的 `https://` URL。
+留空则扩展完全依赖点击激活。手动关闭的标签页在当前页面不会自动重新激活，直到导航到另一个页面。
+
+**配置档与设置。** 按网站自动选择配置档由原生主机负责，因此页面内面板和原生 GTK 面板共享同一份
+状态。视频配置档位于 `~/.config/dlssnr-video/dlssnr/profiles/`，记住的网站选择位于
+`~/.config/dlssnr-video/dlssnr/auto-profiles.json`，共享内存位于 `$DLSSNR_RUNTIME_DIR/shm.bin`
+（默认 `~/dlssnr-runtime/shm.bin`）。完整的浏览器视频指南（包括 Vulkan 模式下的原生面板和
+Firefox 设置）参见 [`VIDEO_APP.md`](VIDEO_APP.md)。
+
+**状态含义。** `helper_state=4` 表示助手进程在运行；`model_up=0` 在层尚未合成第一帧之前是正常的，
+面板会显示 *"Helper running — model not ready yet"*，而不是 "Helper not running"。
+桥接层的 `chrome.ready` 只要求助手正在运行，且存在映射了视频层的 Chrome GPU 进程，因此新启动的
+助手不会让整个流程陷入死锁。
+
+**ROI 与交换链尺寸。** ROI 根据页面的布局视口计算，因为 Chrome 的 Vulkan 交换链覆盖的是内容区域
+（窗口减去浏览器边框），而不是整个窗口。如果日志出现
+`swapchain ... is not the ROI's ...; presenting it raw`，说明两者尺寸不一致，任何帧都不会被增强。
+设置 `DLSSNR_LOG` 后，层日志会写入该文件，否则写入浏览器进程的标准错误输出。
+
 ## 功能特性
 
 - 面向原生 Linux 游戏与 Proton 游戏的 Vulkan 隐式层。
@@ -681,6 +721,22 @@ rm -f "/tmp/dlssnr-$UID/shm.bin"
 `~/.config/environment.d/dlssnr.conf` 中的 `VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"`
 固定顺序（参见[从 tarball 安装](#从-tarball-安装)）；如果你是在 `0.2.5-3` 之前安装的，请自行添加该
 文件，然后注销并重新登录。
+
+对于浏览器视频，如果 Chrome 正在播放而面板显示 *"no presenter — waiting for first frame"*，
+请依次检查：
+
+1. 该标签页是否已激活（点击过图标，或在自动网站列表中）？未激活的标签页永远不会开启增强。
+2. 原生桥接的 `chrome.ready` 和 `helper.status` 是否都就绪？更新后仍在运行的旧原生主机可能保留
+   过期的就绪判断 —— 重新加载扩展即可让它重启。
+3. 层日志是否出现 ROI/交换链尺寸不匹配，例如
+   `swapchain 1920x1048 is not the ROI's 1920x1080; presenting it raw`？请更新扩展；ROI 必须使用
+   内容区域的尺寸。
+4. 日志是否出现 `vkAllocateMemory failed for ... VkResult -2` 以及 *"composition cannot run here"*？
+   降低当前视频配置档中的 `set_model_resolution`（例如从 `1.3` 改为 `1.0`）；浏览器流式播放时，
+   超采样可能超出 GPU 的设备内存预算。
+
+在合成表面分配失败期间，GPU 进程可能发生 "Context lost" 重启；模型分辨率调整到合适值后，
+层会恢复，`layer_frames` 会重新增长。
 
 ## 重要说明
 

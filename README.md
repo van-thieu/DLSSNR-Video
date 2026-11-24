@@ -39,6 +39,52 @@ Fork-specific environment controls:
 DLSSNR_ALLOW_OVERLAY=1          keep the layer active in Steam's auxiliary processes
 ```
 
+## Browser Video (Quick Start)
+
+The browser path is a separate profile, layer manifest and shared-memory file from the game path.
+Launch the video browser through `~/.local/bin/dlss5-chrome` (the *Google Chrome* desktop entry on
+this machine) or `~/.local/bin/dlss5-firefox-temp` for the snap-friendly Firefox loader. Chrome is
+started with a dedicated profile, an ANGLE/Vulkan present path and the video layer enabled; the layer
+library and the native messaging host come from this repository.
+
+Load the unpacked extension from [`browser-extension/chrome/`](browser-extension/chrome/) via
+*Developer mode → Load unpacked* in `chrome://extensions`, or load
+[`browser-extension/firefox/`](browser-extension/firefox/) as a temporary add-on. The native
+messaging host is `browser-extension/host/dlssnr_bridge.py` (`com.dlssnr.bridge`); for Firefox the
+same commands go over a loopback daemon on `127.0.0.1:8765`.
+
+**Activation is click-based.** Nothing happens on a page until you click the toolbar icon (or press
+`Alt+Shift+D`). That arms the tab: the panel opens and video gating starts. Clicking again, pressing
+the shortcut again, or the panel's **×** disarms it and switches the pass off. Arming lasts for the
+current page — a full navigation, closing the tab or restarting the browser clears it. Sites you
+never click are completely inert: no panel, no reports, no ROI, no auto profile and no enhancement,
+even when they are playing video.
+
+**Auto sites.** Open the extension options (`chrome://extensions` → Details → *Extension options*,
+or the ⚙ button in the panel) to allowlist sites that arm themselves on load. Rules can be a host
+(`youtube.com`, `www` optional), a host plus subdomains (`*.netflix.com`), a host + path prefix
+(`example.com/watch`), or a full `https://` URL. An empty list keeps the extension purely
+click-activated. A tab you manually switch off stays off until you navigate to a different page.
+
+**Profiles and settings.** Auto-profile-by-site is owned by the native host, so the in-page panel and
+the native GTK panel share one source of truth. Video profiles live in
+`~/.config/dlssnr-video/dlssnr/profiles/`, the remembered site choices in
+`~/.config/dlssnr-video/dlssnr/auto-profiles.json`, and the shared memory in
+`$DLSSNR_RUNTIME_DIR/shm.bin` (default `~/dlssnr-runtime/shm.bin`). See
+[`VIDEO_APP.md`](VIDEO_APP.md) for the full browser video guide, including the Vulkan-mode native
+panel and Firefox setup.
+
+**Status wording.** `helper_state=4` means the helper process is alive. `model_up=0` is normal until
+the layer has composed its first frame; the panel says *"Helper running — model not ready yet"*
+rather than "Helper not running". The bridge's `chrome.ready` only requires a running helper and a
+Chrome GPU process with the video layer mapped, so a fresh helper cannot deadlock startup.
+
+**ROI and swapchain size.** The ROI is computed from the page's layout viewport, because Chrome's
+Vulkan swapchain covers the content area (window minus browser chrome), not the whole window. If the
+log reports `swapchain ... is not the ROI's ...; presenting it raw`, the two sizes disagree and no
+frame is enhanced. With `DLSSNR_LOG` set, the layer logs to that file; otherwise it writes to the
+browser process' stderr.
+
 ## Features
 
 - Vulkan implicit layer for native Linux games and Proton games.
@@ -694,6 +740,22 @@ and the frames are layered incorrectly. The installers pin the order via
 `VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"` in `~/.config/environment.d/dlssnr.conf`
 (see [Install From Tarball](#install-from-tarball)); if you installed before `0.2.5-3`, add that file
 yourself and log out and back in.
+
+For browser video, if Chrome is streaming but the panel says *"no presenter — waiting for first
+frame"*, check in order:
+
+1. Is the tab armed (icon clicked or on the auto-site list)? Unarmed tabs never enable the pass.
+2. Does the native bridge report `chrome.ready` and `helper.status` as running? An old long-lived
+   native host can keep stale readiness logic after an update — reload the extension to respawn it.
+3. Does the layer log show a ROI/swapchain size mismatch, e.g.
+   `swapchain 1920x1048 is not the ROI's 1920x1080; presenting it raw`? Update the extension; the ROI
+   must use the content-area size.
+4. Does the log show `vkAllocateMemory failed for ... VkResult -2` followed by *"composition cannot
+   run here"*? Lower `set_model_resolution` in the active video profile (e.g. `1.0` instead of
+   `1.3`); supersampling can exceed the GPU's device-memory budget while a browser is streaming.
+
+A GPU process "Context lost" restart can happen while the composition surfaces fail to allocate;
+with a supported model resolution the layer comes back and `layer_frames` starts climbing again.
 
 ## Important Notes
 
