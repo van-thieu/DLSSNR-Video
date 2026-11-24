@@ -1,16 +1,19 @@
-# DLSS5VKLayer
+# DLSSNR-Video
 
 [English](README.md) · **简体中文**
 
-DLSS5VKLayer 是一个 Linux Vulkan 层加助手服务，它把呈现的帧转发给运行在 Wine 或自定义 Proton 兼容性工具下的 Windows NGX 神经渲染助手。
+DLSSNR-Video 在 Linux 上把 DLSS5 神经渲染用于**浏览器视频**。它由一个 Linux Vulkan 层和助手服务
+组成，把呈现的帧转发给运行在 Wine 或自定义 Proton 兼容性工具下的 Windows NGX 神经渲染助手；
+浏览器扩展负责找到当前可见的 `<video>` 元素，并用感兴趣区域（ROI）把处理限制在画面上。
 
 本项目处于实验阶段，目标是本地测试与研究。
 
-## 关于此 Fork
+## 关于本项目
 
-本仓库是 [bmitch87/DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) 的 Fork，
-上游跟踪在 `0.3.2-1` 标签。它在该基线之上带有本地改动，本 README 其余部分描述的是
-这个 Fork，而不是上游。
+本仓库从 [van-thieu/DLSS5VKLayer](https://github.com/van-thieu/DLSS5VKLayer) 拆分而来，后者仍然是
+面向**游戏**的项目。两者都源自 [bmitch87/DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer)
+（上游 `0.3.2-1`），但现在已经分开：游戏请使用 DLSS5VKLayer，浏览器视频请使用本仓库。两者各有
+自己的共享内存协议版本与层清单，因此可以同时安装。
 
 - **呈现路径不再取走应用程序的等待信号量。** 捕获副本改为通过队列顺序排在应用程序
   自身提交之后，这不会消耗任何东西，而应用程序的信号量会原样交还。取走它们会让呈现

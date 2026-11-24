@@ -1,16 +1,21 @@
-# DLSS5VKLayer
+# DLSSNR-Video
 
 **English** · [简体中文](README.zh-CN.md)
 
-DLSS5VKLayer is a Linux Vulkan layer plus helper service that forwards presented frames to a Windows NGX neural-rendering helper running under Wine or a custom Proton compatibility tool.
+DLSSNR-Video applies DLSS5 neural rendering to **browser video** on Linux. It is a Linux Vulkan
+layer plus helper service that forwards presented frames to a Windows NGX neural-rendering helper
+running under Wine or a custom Proton compatibility tool, with a browser extension that finds the
+visible `<video>` element and a region of interest (ROI) that limits work to the picture.
 
 This project is experimental. It is intended for local testing and research.
 
-## This Fork
+## About this project
 
-This repository is a fork of [bmitch87/DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer),
-with upstream tracked at the `0.3.2-1` tag. It carries local changes on top of that base, and the
-rest of this README describes the fork rather than upstream.
+This repository was split out of [van-thieu/DLSS5VKLayer](https://github.com/van-thieu/DLSS5VKLayer),
+which remains the **game**-focused project. The two share their origins in
+[bmitch87/DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) (`0.3.2-1` upstream), but are now
+separate: use DLSS5VKLayer for games and this repository for browser video. Each has its own
+shared-memory protocol version and its own installed layer manifest, so they can coexist.
 
 - **The present path no longer takes the application's wait semaphores.** The capture copy is
   ordered behind the application's own submit by queue order instead, which consumes nothing, and
