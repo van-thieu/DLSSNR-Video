@@ -1,0 +1,23 @@
+[Unit]
+Description=DLSS5 browser bridge daemon (Firefox loopback HTTP + native messaging)
+Documentation=file:/home/vthieu/Downloads/DLSS5Video/VIDEO_APP.md
+
+[Service]
+Type=simple
+# Keep the snap browser, this daemon, the player and the helper on the same runtime paths.
+Environment=TMPDIR=%h/dlssnr-runtime
+Environment=DLSSNR_RUNTIME_DIR=%h/dlssnr-runtime
+Environment=DLSSNR_HOME=%h
+Environment=DLSSNR_BROWSER=firefox
+Environment=DLSSNR_SHM=%h/dlssnr-runtime/shm.bin
+Environment=DLSSNR_DMABUF=0
+Environment=DLSSNR_HOTKEY_BACKEND=none
+# The content script uses these to detect an enhanced browser and hand the UI to the native panel.
+Environment=VKLayer_DLSS5=1
+Environment=VK_INSTANCE_LAYERS=VK_LAYER_NV_dlssnr_video
+ExecStart=/usr/bin/python3 %h/Downloads/DLSS5Video/browser-extension/host/dlssnr_bridge.py --server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

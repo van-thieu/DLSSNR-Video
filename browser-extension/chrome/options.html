@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DLSS5 Video Controls — Auto sites</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 28px; font: 14px/1.5 system-ui, sans-serif;
+         background: #121216; color: #e8e8ec; max-width: 680px; }
+  h1 { margin: 0 0 6px; font-size: 20px; }
+  p { color: #a9a9b4; margin: 0 0 18px; }
+  code { background: #23232a; padding: 2px 6px; border-radius: 4px; color: #a5d6a7; font-size: 13px; }
+  form { display: flex; gap: 8px; margin-bottom: 18px; }
+  input { flex: 1; min-width: 0; padding: 9px 11px; border-radius: 6px;
+          border: 1px solid #3a3a44; background: #1c1c22; color: #eee; font: inherit; }
+  input:focus { outline: 2px solid #4c8b50; outline-offset: 1px; }
+  button { padding: 9px 14px; border-radius: 6px; border: 1px solid #4c8b50;
+           background: #2c5a30; color: #eaffea; font: inherit; cursor: pointer; }
+  button:hover { background: #36703b; }
+  ul { list-style: none; padding: 0; margin: 0 0 16px; border: 1px solid #32323a; border-radius: 8px; }
+  li { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+       padding: 10px 12px; border-bottom: 1px solid #2a2a31; }
+  li:last-child { border-bottom: 0; }
+  li.empty { color: #8a8a94; font-style: italic; }
+  li button { padding: 5px 10px; background: transparent; border-color: #6b3a3a; color: #ffb4b4; }
+  li button:hover { background: #4a2626; }
+  #status { min-height: 20px; color: #a5d6a7; }
+  .hint { font-size: 12px; color: #8a8a94; margin-top: -10px; }
+</style>
+</head>
+<body>
+  <h1>Auto sites</h1>
+  <p>Sites in this list activate the extension automatically when the page loads. Every other site
+     stays completely inert until you click the toolbar icon (or press <code>Alt+Shift+D</code>).</p>
+
+  <form id="add-form">
+    <input id="site" type="text" spellcheck="false" autocomplete="off"
+           placeholder="youtube.com   *.netflix.com   site.com/watch">
+    <button type="submit">Add</button>
+  </form>
+  <p class="hint">Match by host (<code>youtube.com</code>, <code>www</code> is optional), subdomains
+     (<code>*.example.com</code>), or host + path prefix (<code>example.com/watch</code>). A full
+     <code>https://</code> URL works too.</p>
+
+  <ul id="sites"></ul>
+  <div id="status"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>

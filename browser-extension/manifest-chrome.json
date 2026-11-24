@@ -6,6 +6,7 @@
   "permissions": [
     "nativeMessaging",
     "activeTab",
+    "tabs",
     "scripting",
     "storage"
   ],
@@ -14,6 +15,10 @@
   ],
   "action": {
     "default_title": "DLSS5 Video Controls"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "content_scripts": [
     {

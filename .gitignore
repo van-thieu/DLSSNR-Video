@@ -13,3 +13,10 @@ moc_*.cpp
 
 # Per-machine NGX/OptiScaler drop used by the DLSS NR helper; never redistributable
 /dlssnr/
+
+# AMO-signed Firefox add-on and web-ext scratch output (unsigned XPI is kept, signed one is not)
+/browser-extension/signed/
+/web-ext-artifacts/
+__pycache__/
+*.pyc
+.amo-upload-uuid

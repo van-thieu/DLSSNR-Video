@@ -26,17 +26,86 @@ uses `24d3d842-83df-5342-9b6f-dcfd0efb52ba`.
 
 A native messaging host (`browser-extension/host/dlssnr_bridge.py`) is registered for both browsers
 under `com.dlssnr.bridge`. It talks to the same shared memory via `dlssnr-shmctl` and starts/stops
-the helper through `dlssnr-helper`, so the desktop GUI is **not required** for video: the
+the helper through `dlssnr-video-helper`, so the desktop GUI is **not required** for video: the
 extension's **Helper → Start / Restart / Stop** buttons manage the model process, and the same
-**Auto** toggle can keep NR on only while a visible tab has playing video.
+**Auto** toggle can keep NR on only while a visible tab has playing video. The desktop launcher
+(`~/.local/bin/dlssnr-gui-video`) pins `DLSSNR_HELPER_CLI` to the same video helper so its buttons
+cannot accidentally control the game helper.
 
-The panel is hidden at startup. Click the extension's toolbar icon to show/hide it; the background
-content script keeps reporting video state for gating even while the panel is hidden.
+`helper_state=4` means the helper process is alive; `model_up=0` is normal until the layer has
+composed its first frame. `chrome.ready` therefore only requires a running helper plus a Chrome GPU
+process with the video layer mapped — requiring `model_up`/`layer_pid` first deadlocked startup after
+a helper restart (the pass was never enabled, so no frame was ever composed). The panel now says
+"Helper running — model not ready yet" instead of the misleading "Helper not running".
+
+**Snap Firefox (this machine):** Firefox Release refuses to permanently install an unsigned
+add-on, and snap confinement makes native messaging unreliable (private `/tmp`, D-Bus portal). Use:
+
+```bash
+~/.local/bin/dlss5-firefox-temp
+```
+
+This starts the bridge daemon on `127.0.0.1:8765` and uses `web-ext run` to load
+`browser-extension/firefox/` as a **temporary add-on** (it must be reloaded each Firefox restart;
+`~/.local/bin/firefox` and the desktop launcher now call this script). The Firefox build sends
+commands to the daemon over loopback HTTP instead of native messaging; the Chrome build still uses
+`com.dlssnr.bridge` native messaging. Shared memory, sockets and flags live in `~/dlssnr-runtime`
+via `TMPDIR`/`DLSSNR_SHM`/`DLSSNR_RUNTIME_DIR` so the confined browser and the unconfined
+player/helper agree on paths. A permanent install would require an AMO-signed XPI or a
+non-snap Firefox Developer/ESR build.
+
+The same native **DLSS5 Controls** window is used here: the Firefox background forwards
+`panel.toggle` and `browser.tab_report` to the loopback daemon, whose `handle()` is the same one
+Chrome reaches over native messaging. Auto-profile state is owned by that daemon, so the toggle and
+per-site choices work identically in both browsers. An unsigned build for the temporary loader is
+kept at `browser-extension/dlss5-firefox.xpi` (files at the zip root, rebuilt from
+`browser-extension/firefox/`).
+
+#### Permanent install (AMO-signed XPI)
+
+Firefox Release ignores `xpinstall.signatures.required`, so an unsigned XPI cannot be installed
+permanently. Sign it with a free **unlisted** AMO submission:
+
+1. Create API credentials at <https://addons.mozilla.org/en-US/developers/addon/api/key/> and save
+   them in `~/.config/dlssnr-video/amo-credentials` (chmod 600):
+   ```
+   AMO_API_KEY="..."
+   AMO_API_SECRET="..."
+   ```
+   (Exporting the same two variables instead of using the file works too.)
+2. Run `./browser-extension/sign-firefox.sh` from the project root. It signs
+   `browser-extension/firefox/` with `web-ext sign --channel unlisted` and writes the result to
+   `browser-extension/signed/`.
+3. Install that signed XPI permanently: `about:addons` → gear → **Install Add-on From File**.
+4. Install the daemon once: `./packaging/install-dlss5-bridge.sh`. The temporary-add-on launcher used
+   to start the bridge; a permanent add-on needs it running independently. The user service listens
+   on `127.0.0.1:8765` with the same Vulkan/runtime environment as the Firefox launcher.
+5. Start Firefox normally from its usual desktop entry — add-on, native panel and daemon are all
+   there, with no reload on restart.
+
+After a UI change, bump `version` in **both** Firefox manifests before re-signing (AMO rejects a
+duplicate version), then repeat steps 2–3. The extension ID is fixed in the manifest, so the native
+host manifest needs no change.
+
+Nothing happens on a page until you click the extension's toolbar icon (or press `Alt+Shift+D`),
+unless the site is on the **auto-site allowlist**. That click (or a matching auto-site) *arms the
+tab*: the panel opens and video gating starts. Clicking again (or pressing the shortcut again,
+or using the panel's **×**) disarms the tab: the panel closes, reporting stops and the pass is
+switched off. Tabs you never clicked and that do not match the allowlist are inert — no panel, no
+reports, no ROI, no auto profile, no enhancement, even when they are playing video (e.g. Amazon).
+
+Open the extension's **Options** (`chrome://extensions` → Details → Extension options, or the ⚙
+button in the panel) to manage the allowlist. Rules may be a host (`youtube.com`, `www` optional),
+a host plus subdomains (`*.netflix.com`), a host + path prefix (`example.com/watch`), or a full
+`https://` URL. Matching tabs arm themselves on load; all others stay click-only. Switching a tab
+off manually sticks until you navigate to a different page, so an auto-site will not re-arm itself
+behind your back. Arming lasts for the current page: a full navigation, closing the tab or
+restarting the browser clears it.
 
 **Profiles are segregated.** The extension reads and writes only
 `~/.config/dlssnr/video-profiles/`; the desktop helper keeps its game profiles in
 `~/.config/dlssnr/profiles/`. Removing or renaming a profile in the browser can no longer affect a
-game profile. Once installed, a floating **DLSS5 Neural Rendering** panel appears on video pages with:
+game profile. Once a tab is armed with the toolbar icon, a floating **DLSS5 Neural Rendering** panel appears with:
 
 - **Enhance this video** — sends the page's `<video>` URL to the running DLSS5 Video player (or
   launches it), via a local socket. The enhanced video plays in that window, not in Chrome.
@@ -84,6 +153,34 @@ notes:
 - An occasional "present fence still pending; swapchain passes through" is the layer's fail-open
   path; it is not fatal and Chrome keeps presenting.
 - The normal `google-chrome.desktop` (ANGLE GL) does not load the layer. This is a separate entry.
+- `DLSSNR_SHM` must name a **real** file, not a symlink: the layer opens it with `O_NOFOLLOW`.
+  The canonical file is `~/dlssnr-runtime/shm.bin` (real file, 0600); `TMPDIR` points at the same
+  permanent directory for sockets and logs, so a `/tmp` wipe cannot break the pipeline. Passing a
+  symlink makes every layer load log `[shm] open … failed`, so no presenter attaches. The helper's
+  `~/.config/dlssnr-video/dlssnr/config.ini` must pin the same path.
+
+### Where the control panel lives in Vulkan mode
+
+Because the layer captures Chrome's final composited swapchain, an in-page control panel is just
+more pixels in that frame: side-by-side compare samples the captured picture into both halves (two
+copies of the panel), and the composed result is copied back over the browser's pixels, covering the
+real control with a frozen raster of itself. CSS z-index cannot help — the rewrite happens below the
+DOM compositor.
+
+In a Vulkan-enhanced browser the extension therefore does **not** attach its panel to the page. The
+toolbar icon (or `Alt+Shift+D`) opens **DLSS5 Controls**, a small always-on-top GTK window that
+hosts the same panel in its own X11 surface, outside Chrome's swapchain, where the layer cannot
+enhance, duplicate or cover it. The content script still reports video state and ROI for the pass;
+only the UI moves.
+
+The native host starts `browser-extension/host/dlssnr_panel.py` on the first toolbar toggle. It
+serves the extension's own `panel.css` and `content.js` to a WebKit2 view over localhost, so there
+is no second copy of the control definitions to keep in sync; the page is pinned to fill the window
+and the GTK title bar handles dragging. Auto-profile-by-site is owned by the native host in this
+mode (state in `~/.config/dlssnr-video/dlssnr/auto-profiles.json`), so its toggle and per-site
+profile choices work here too. Closing the window exits the panel process; the next toolbar click
+reopens it. Launch Chrome without `VKLayer_DLSS5` (the ordinary desktop entry) to get the old
+in-page panel back.
 
 ## Browser video (CDP grab)
 

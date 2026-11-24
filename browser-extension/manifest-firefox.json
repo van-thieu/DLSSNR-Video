@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "DLSS5 Video Controls",
-  "version": "2.1.6",
+  "version": "2.2.6",
   "description": "Tune DLSS5 neural rendering on streaming video and send the playing video to the DLSS5 player.",
   "permissions": [
     "nativeMessaging",
     "activeTab",
+    "tabs",
     "scripting",
     "storage"
   ],
@@ -14,6 +15,10 @@
   ],
   "action": {
     "default_title": "DLSS5 Video Controls"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "content_scripts": [
     {
@@ -37,8 +42,13 @@
   },
   "browser_specific_settings": {
     "gecko": {
-      "id": "24d3d842-83df-5342-9b6f-dcfd0efb52ba",
-      "strict_min_version": "115.0"
+      "id": "{24d3d842-83df-5342-9b6f-dcfd0efb52ba}",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
     }
   },
   "commands": {

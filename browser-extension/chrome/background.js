@@ -1,15 +1,77 @@
-// Native messaging bridge plus active-video gating.
+// Native messaging bridge plus click-to-activate, active-video gating.
 //
-// Content scripts report whether their tab is visible and has a playing <video>. The pass is enabled
-// only while at least one visible, auto-enabled tab is playing video. Manual NR on/off buttons take
-// over for 30 seconds, then auto resumes. The layer reads `enabled` live from the shared header.
+// A tab is armed either by the toolbar icon (or Alt+Shift+D) or automatically on pages listed in
+// the "auto sites" allowlist (extension options). Reports from any other tab are ignored, so merely
+// visiting some other site (Amazon, news, ...) never enables the pass or shows a panel. Once armed,
+// the pass is enabled only while that tab has a visible, playing <video>. Manual NR on/off buttons
+// take over for 30 seconds, then auto resumes. The layer reads `enabled` live from the shared header.
 let port = null;
 const reports = new Map();       // tabId -> { visible, playing, auto, rect, ts }
+const armedTabs = new Set();     // tabIds currently armed (icon click or auto-site match)
+const manualOff = new Map();     // tabId -> URL where the user switched it off (no auto re-arm there)
+const tabUrl = new Map();        // tabId -> last seen http(s) URL
+const ARMED_KEY = 'armedTabs';
+const AUTO_SITES_KEY = 'autoSites';
+let autoSites = [];              // host/path rules, e.g. "youtube.com", "*.netflix.com", "site.com/watch"
 let manualUntil = 0;
 let lastDesired = null;
 let offSince = 0;                // debounce: video can briefly report paused while buffering/scrolling
 const OFF_DELAY_MS = 6000;
 let pauseHold = false;           // compare mode keeps the last frame frozen while the video is paused
+
+if (chrome.storage && chrome.storage.session) {
+  chrome.storage.session.get([ARMED_KEY], (d) => {
+    if (d && Array.isArray(d[ARMED_KEY])) d[ARMED_KEY].forEach(id => armedTabs.add(id));
+    applyGating();
+  });
+}
+function saveArmed() {
+  if (chrome.storage && chrome.storage.session)
+    chrome.storage.session.set({ [ARMED_KEY]: [...armedTabs] });
+}
+
+// ---- auto-site allowlist -------------------------------------------------
+// Rule syntax: "example.com" (host, www optional), "*.example.com" (host + subdomains),
+// "example.com/path" (host plus URL path prefix), or a full https:// URL. Matching is
+// case-insensitive; no rule means no site ever auto-arms (pure click-to-activate).
+function matchSite(url, rule) {
+  rule = String(rule || '').trim().toLowerCase();
+  if (!rule) return false;
+  let u;
+  try { u = new URL(url); } catch (e) { return false; }
+  if (!/^https?:$/.test(u.protocol)) return false;
+  let hostPart = rule, pathPart = '';
+  const slash = rule.indexOf('/');
+  if (slash >= 0) { hostPart = rule.slice(0, slash); pathPart = rule.slice(slash); }
+  hostPart = hostPart.replace(/^https?:/, '').replace(/^\/+/, '').replace(/\/+$/, '');
+  const host = u.hostname.toLowerCase();
+  let hostMatch;
+  if (hostPart.startsWith('*.')) {
+    const base = hostPart.slice(2);
+    hostMatch = host === base || host.endsWith('.' + base);
+  } else {
+    hostMatch = host === hostPart || host === 'www.' + hostPart || hostPart === 'www.' + host;
+  }
+  if (!hostMatch) return false;
+  if (!pathPart) return true;
+  return (u.pathname + u.search).toLowerCase().startsWith(pathPart.toLowerCase());
+}
+function isAutoSite(url) {
+  return autoSites.some(rule => matchSite(url, rule));
+}
+if (chrome.storage && chrome.storage.local) {
+  chrome.storage.local.get([AUTO_SITES_KEY], (d) => {
+    if (d && Array.isArray(d[AUTO_SITES_KEY])) autoSites = d[AUTO_SITES_KEY].filter(x => typeof x === 'string' && x.trim());
+    reevaluateAutoTabs();
+  });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes[AUTO_SITES_KEY]) {
+      const v = changes[AUTO_SITES_KEY].newValue;
+      autoSites = Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.trim()) : [];
+      reevaluateAutoTabs();
+    }
+  });
+}
 
 // Auto-profile-by-site: remember a profile per hostname and apply it when that site's video starts.
 let autoProfileEnabled = true;
@@ -61,6 +123,8 @@ if (chrome.storage && chrome.storage.local) {
   chrome.storage.local.get(['autoProfileEnabled', 'siteProfiles'], (d) => {
     if (d && typeof d.autoProfileEnabled === 'boolean') autoProfileEnabled = d.autoProfileEnabled;
     if (d && d.siteProfiles && typeof d.siteProfiles === 'object') siteProfiles = d.siteProfiles;
+    // Migrate remembered per-site choices into the native host, which now owns auto-profile.
+    requestToNative({ cmd: 'auto_profile_import', sites: siteProfiles }).catch(() => {});
   });
 }
 
@@ -114,15 +178,18 @@ function applyGating() {
   if (pauseHold) return;          // frozen frame: do not turn the pass off
   if (Date.now() < manualUntil) return;
   const now = Date.now();
-  const anyAuto = [...reports.values()].some(r => r.auto && now - r.ts < 8000);
-  if (!anyAuto) return;                       // no auto-enabled tab: leave manual state alone
-  const active = [...reports.values()].find(r => r.auto && r.visible && r.playing && now - r.ts < 8000);
+  // Only reports from armed tabs count. With nothing armed, switch the pass off immediately: a
+  // video profile restored at browser startup can otherwise leave `enabled=1` in the SHM header.
+  const anyArmed = armedTabs.size > 0;
+  const entry = [...reports.entries()].find(([id, r]) =>
+    armedTabs.has(id) && r.auto && r.visible && r.playing && now - r.ts < 8000);
+  const active = entry ? entry[1] : null;
   const desired = active ? 1 : 0;
   if (desired === 0 && lastDesired !== 0) {
-    // A video can briefly report paused/blank during a scroll transition or rebuffer. Don't let that
-    // flicker the whole pass off; require several seconds of no active video first.
-    if (!offSince) offSince = now;
-    if (now - offSince < OFF_DELAY_MS) return;
+    // Debounce only while an armed tab is around. A video can briefly report paused while
+    // buffering/scrolling; with no armed tab there is nothing to wait for.
+    if (anyArmed && !offSince) offSince = now;
+    if (anyArmed && now - offSince < OFF_DELAY_MS) return;
   } else {
     offSince = 0;   // video is playing again — re-enable immediately
   }
@@ -146,45 +213,112 @@ function applyGating() {
   }
 }
 
-// The toolbar action toggles the panel in the active tab. The content script stays injected for
-// gating (it must keep reporting video state), but the UI starts hidden until the icon is clicked.
-async function showPanel(tabId) {
+// The toolbar icon (or shortcut) arms a tab: until then the content script sends nothing and no
+// panel is shown. Clicking again disarms it. This is the extension-side "On click" behaviour.
+async function messageTab(tabId, msg) {
   try {
-    await chrome.tabs.sendMessage(tabId, { cmd: 'show_panel' });
+    await chrome.tabs.sendMessage(tabId, msg);
   } catch (e) {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-    await chrome.tabs.sendMessage(tabId, { cmd: 'show_panel' });
+    // No content script yet (fresh navigation, chrome:// page, etc.). Inject then retry.
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+      await chrome.tabs.sendMessage(tabId, msg);
+    } catch (e2) { /* page not injectable */ }
   }
 }
 
-chrome.action.onClicked.addListener(async (tab) => {
-  await showPanel(tab.id);
+async function setArmed(tabId, on, source = 'user') {
+  reports.delete(tabId);          // discard a stale pre-activation report
+  if (on) {
+    armedTabs.add(tabId);
+    manualOff.delete(tabId);
+  } else {
+    armedTabs.delete(tabId);
+    // If the user switched it off, do not auto-arm again until this page actually navigates away.
+    if (source === 'user') manualOff.set(tabId, tabUrl.get(tabId) || '');
+    // A manual NR toggle or paused compare from this tab must not keep the pass on once it is gone.
+    if (armedTabs.size === 0) {
+      manualUntil = 0;
+      pauseHold = false;
+      offSince = 0;
+    }
+  }
+  saveArmed();
+  await messageTab(tabId, { cmd: on ? 'activate' : 'deactivate' });
+  applyGating();
+}
+
+async function toggleArmed(tabId) {
+  await setArmed(tabId, !armedTabs.has(tabId), 'user');
+}
+
+// Arm every open tab whose URL matches the allowlist, unless the user explicitly switched that tab
+// off on this page. Used on startup, when the allowlist is edited in options, and on navigation.
+async function reevaluateAutoTabs() {
+  if (!autoSites.length) return;
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs) {
+      if (!t.id || !/^https?:/.test(t.url || '')) continue;
+      if (armedTabs.has(t.id) || manualOff.has(t.id)) continue;
+      if (isAutoSite(t.url)) await setArmed(t.id, true, 'auto');
+    }
+  } catch (e) { /* tabs API unavailable */ }
+}
+
+function maybeAutoArm(tabId, url) {
+  if (!url || !isAutoSite(url)) return;
+  if (armedTabs.has(tabId) || manualOff.has(tabId)) return;
+  setArmed(tabId, true, 'auto');
+}
+
+// Navigation (changeInfo.url) and the end of the initial load are the only moments we auto-arm,
+// so clicking the icon to switch a page off is not immediately undone by another page event.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!tab || !/^https?:/.test(tab.url || '')) return;
+  tabUrl.set(tabId, tab.url);
+  // Only a real navigation away from the page where the user switched the extension off cancels
+  // that choice. A repeated load event for the same URL must not re-arm it behind their back.
+  if (changeInfo.url && manualOff.get(tabId) && manualOff.get(tabId) !== tab.url)
+    manualOff.delete(tabId);
+  if (changeInfo.url || changeInfo.status === 'complete') maybeAutoArm(tabId, tab.url);
+});
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  if (armedTabs.has(tabId) || manualOff.has(tabId)) return;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab && tab.url) {
+      tabUrl.set(tabId, tab.url);
+      maybeAutoArm(tabId, tab.url);
+    }
+  } catch (e) { /* tab closed */ }
 });
 
-// PWA/app windows have no extension toolbar icon, so a global shortcut toggles the panel there.
+chrome.action.onClicked.addListener(async (tab) => {
+  await toggleArmed(tab.id);
+});
+
+// PWA/app windows have no extension toolbar icon, so a global shortcut arms/disarms the active tab.
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== '_execute_action') return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) return;
-    try {
-      await chrome.tabs.sendMessage(tab.id, { cmd: 'show_panel' });
-    } catch (e) {
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-      await chrome.tabs.sendMessage(tab.id, { cmd: 'show_panel' });
-    }
+    await toggleArmed(tab.id);
   } catch (e) { /* no page / chrome:// */ }
 });
 
-// After an extension reload, existing tabs keep a stale content script. Re-inject into all pages
-// so the panel reconnects without the user refreshing each tab manually.
+// After an extension reload, an armed tab keeps a stale content script. Re-inject only into tabs
+// the user actually activated, and re-send activate so the panel reconnects without a refresh.
+// Unarmed pages are left completely alone.
 async function reinjectAll() {
   try {
     const tabs = await chrome.tabs.query({});
     for (const t of tabs) {
-      if (!t.id || !/^https?:/.test(t.url || '')) continue;
+      if (!t.id || !armedTabs.has(t.id)) continue;
       try {
         await chrome.scripting.executeScript({ target: { tabId: t.id }, files: ['content.js'] });
+        await chrome.tabs.sendMessage(t.id, { cmd: 'activate' });
       } catch (e) { /* page not injectable */ }
     }
   } catch (e) { /* tabs API unavailable */ }
@@ -194,6 +328,12 @@ chrome.runtime.onStartup.addListener(() => reinjectAll());
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.cmd === 'pause_hold') {
+    const id = sender.tab && sender.tab.id;
+    // Ignore UI chatter from a page the user never armed.
+    if (id != null && !armedTabs.has(id)) {
+      sendResponse({ ok: true, active: pauseHold, ignored: true });
+      return false;
+    }
     const was = pauseHold;
     pauseHold = !!msg.active;
     if (pauseHold) {
@@ -206,56 +346,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true, active: pauseHold });
     return false;
   }
-  if (msg && msg.cmd === 'auto_profile_get') {
-    const active = visibleReport();
-    const host = active ? hostOf(active.url) : '';
-    sendResponse({ ok: true, enabled: autoProfileEnabled, host,
-                   profile: (host && siteProfiles[host]) || lastAutoProfile || '' });
-    return false;
-  }
-  if (msg && msg.cmd === 'auto_profile_set') {
-    autoProfileEnabled = !!msg.enabled;
-    saveAutoSettings();
-    if (autoProfileEnabled) { lastAutoHost = ''; applyAutoProfile(); }
-    sendResponse({ ok: true, enabled: autoProfileEnabled });
-    return false;
-  }
-  if (msg && msg.cmd === 'profile_manual') {
-    const host = hostOf(msg.url);
-    if (host && msg.name) {
-      siteProfiles[host] = msg.name;
-      lastAutoHost = host;
-      lastAutoProfile = msg.name;
-      saveAutoSettings();
-    }
-    sendResponse({ ok: true, host });
-    return false;
-  }
-  if (msg && msg.cmd === 'profile_renamed') {
-    for (const h of Object.keys(siteProfiles))
-      if (siteProfiles[h] === msg.oldName) siteProfiles[h] = msg.newName;
-    if (lastAutoProfile === msg.oldName) lastAutoProfile = msg.newName;
-    profilesCache = null;
-    saveAutoSettings();
+  if (msg && msg.cmd === 'tab_deactivated') {
+    const id = sender.tab && sender.tab.id;
+    if (id != null) setArmed(id, false, 'user');
     sendResponse({ ok: true });
     return false;
   }
-  if (msg && msg.cmd === 'profile_removed') {
-    for (const h of Object.keys(siteProfiles))
-      if (siteProfiles[h] === msg.name) delete siteProfiles[h];
-    if (lastAutoProfile === msg.name) lastAutoProfile = '';
-    profilesCache = null;
-    saveAutoSettings();
-    sendResponse({ ok: true });
-    return false;
-  }
+  // auto_profile_* and profile_manual/renamed/removed fall through to the native host, which owns
+  // that state for both the in-page panel and the native panel (Chrome native messaging, Firefox
+  // loopback HTTP). A second copy here let the two panels overwrite each other's choices.
   if (msg && msg.cmd === 'profiles.save') {
     profilesCache = null;
     // Let requestToNative handle it, but invalidate our cache first.
   }
   if (msg && msg.cmd === 'tab_report') {
     const id = sender.tab && sender.tab.id;
-    if (id != null) {
+    if (id != null && armedTabs.has(id)) {
       reports.set(id, {
         visible: !!msg.visible,
         playing: !!msg.playing,
@@ -268,9 +374,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       });
       if (msg.manual) manualUntil = Date.now() + 30000;
       applyGating();
-      applyAutoProfile();
     }
-    sendResponse({ ok: true });
+    sendResponse({ ok: true, ignored: id == null || !armedTabs.has(id) });
     return false;
   }
   requestToNative(msg).then(sendResponse);
@@ -279,6 +384,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   reports.delete(tabId);
+  manualOff.delete(tabId);
+  tabUrl.delete(tabId);
+  if (armedTabs.delete(tabId)) {
+    if (armedTabs.size === 0) { manualUntil = 0; pauseHold = false; offSince = 0; }
+    saveArmed();
+  }
   applyGating();
 });
-chrome.tabs.onActivated.addListener(() => { applyGating(); applyAutoProfile(); });
+chrome.tabs.onActivated.addListener(() => { applyGating(); });

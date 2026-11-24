@@ -42,6 +42,11 @@
                        r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth);
     let rect = null;
     let intrinsic = null;
+    // Chrome's Vulkan swapchain covers the content area, not the whole window. These are needed
+    // even when no video is playing, because the swap size is reported on every refresh.
+    const factor = (window.devicePixelRatio || 1) * (visualViewport.scale || 1);
+    const visW = document.documentElement.clientWidth || innerWidth;
+    const visH = document.documentElement.clientHeight || innerHeight;
     if (v && r && playing) {
       const vw = v.videoWidth || 0;
       const vh = v.videoHeight || 0;
@@ -62,37 +67,29 @@
           cw = r.width; ch = r.height;
         }
       }
-      // getBoundingClientRect is viewport CSS pixels. The Vulkan swapchain is the whole window,
-      // so add the browser UI around the viewport and convert CSS pixels to device pixels.
-      // Chrome's vertical tabs/side panel sit on the left, so outerWidth-innerWidth is a LEFT offset
-      // here; outerHeight-innerHeight is the bar above the viewport. The visible web area is the
-      // layout viewport (clientWidth/clientHeight), which excludes the scrollbar.
-      const factor = (window.devicePixelRatio || 1) * (visualViewport.scale || 1);
-      const chromeLeft = Math.max(0, outerWidth - innerWidth);
-      const chromeTop = Math.max(0, outerHeight - innerHeight);
-      const visW = document.documentElement.clientWidth || innerWidth;
-      const visH = document.documentElement.clientHeight || innerHeight;
+      // getBoundingClientRect is already in viewport CSS pixels, and Chrome's Vulkan swapchain is
+      // the *content area*, not the whole browser window. Adding outerWidth/innerWidth offsets
+      // broke presenting: the layer saw a ROI for e.g. 1920x1080 while Chrome presented 1920x1048
+      // (window minus tab bar / omnibox) and rejected every frame as a size mismatch. Use the
+      // layout viewport for both the swap size and the ROI, then convert CSS px to device px.
       const left = Math.max(0, r.left + ox);
       const top = Math.max(0, r.top + oy);
       const right = Math.min(visW, left + cw);
       let bottom = Math.min(visH, top + ch);
-      // TikTok (and similar players) draw their progress/control bar INSIDE the <video> box. The
-      // layer sees the composited result, so enhancing the whole element also enhances that UI.
-      // Cut the ROI above the first progress/control bar in the lower half of the video.
-      const uiTop = [...document.querySelectorAll('div,span')]
-        .filter(e => /progress|seek|control/i.test((e.className || '').toString()) && e.getBoundingClientRect().height > 0)
-        .map(e => e.getBoundingClientRect())
-        .filter(b => b.top > r.top + r.height * 0.5 && b.top < r.bottom && b.left <= r.right && b.right >= r.left)
-        .reduce((m, b) => Math.min(m, b.top), Infinity);
-      if (uiTop < bottom) bottom = uiTop;
+      // Cover the whole visible picture. An earlier version shortened the ROI at the first
+      // element whose class contained "control"/"progress" in the lower half of the video. Sites
+      // such as TikTok/Douyin wrap their controls in a tall container that starts ~80% down, which
+      // silently left the bottom fifth of the video un-enhanced. The site's own control pixels are
+      // part of the composited frame; the layer should process all of them, not an arbitrary top
+      // slice. (The extension's own controls are now in a separate native window.)
       // Floor the origin and ceil the far edge: getBoundingClientRect can be fractional, and
       // rounding both ends leaves a one-pixel un-enhanced outline at the top/right of the video.
-      const x0 = Math.floor((chromeLeft + left) * factor);
-      const y0 = Math.floor((chromeTop + top) * factor);
+      const x0 = Math.floor(left * factor);
+      const y0 = Math.floor(top * factor);
       // One extra device pixel on the far edges: Chrome's present path rounds the visible frame by
       // a pixel, and without this the last column/row of the video is left un-enhanced (bright line).
-      const x1 = Math.ceil((chromeLeft + right) * factor) + 1;
-      const y1 = Math.ceil((chromeTop + bottom) * factor) + 1;
+      const x1 = Math.ceil(right * factor) + 1;
+      const y1 = Math.ceil(bottom * factor) + 1;
       rect = { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
       intrinsic = { w: vw, h: vh, fit };
     }
@@ -103,8 +100,8 @@
       hasVideo: !!v,
       rect,
       intrinsic,
-      swapW: Math.round(outerWidth * (window.devicePixelRatio || 1) * (visualViewport.scale || 1)),
-      swapH: Math.round(outerHeight * (window.devicePixelRatio || 1) * (visualViewport.scale || 1)),
+      swapW: Math.round(visW * factor),
+      swapH: Math.round(visH * factor),
       url: location.href,
     };
   };
@@ -117,9 +114,10 @@
   let autoRestartEnabled = false;
   let manualRoi = false;
   let helperOn = false;
-  const reportState = (manual = false) => send({
-    cmd: 'tab_report', ...videoState(), auto: autoEnabled, manual,
-  });
+  const reportState = (manual = false) => {
+    if (!activated) return Promise.resolve({ ok: false, inactive: true });
+    return send({ cmd: 'tab_report', ...videoState(), auto: autoEnabled, manual });
+  };
 
   const setToggle = (el, on) => el.classList.toggle('on', !!on);
   const bindToggle = (id, get, set) => {
@@ -136,6 +134,10 @@
   // recreated on reload. Turn the pass off before the page goes away and keep it off briefly after.
   let suppressSent = false;
   const suppressForReload = () => {
+    if (!activated) return;
+    // Arming is per page: leaving this document (including a full navigation to another site)
+    // disarms the tab, like Chrome's "On click" site access. The next icon click arms the new page.
+    send({ cmd: 'tab_deactivated' });
     if (suppressSent) return;
     suppressSent = true;
     send({ cmd: 'suppress', ms: 4000 });
@@ -147,7 +149,7 @@
   const panel = document.createElement('div');
   panel.id = 'dlss5-panel';
   panel.innerHTML = `
-    <div id="dlss5-head"><span>DLSS5 Neural Rendering</span><button id="dlss5-close">×</button></div>
+    <div id="dlss5-head"><span>DLSS5 Neural Rendering</span><span style="margin-left:auto;display:flex;gap:6px"><button id="dlss5-options" title="Auto sites (extension options)">⚙</button><button id="dlss5-close">×</button></span></div>
     <div id="dlss5-body">
       <div id="dlss5-status">Connecting...</div>
       <div id="dlss5-roi-note" class="dlss5-note">ROI initializing...</div>
@@ -195,10 +197,22 @@
   let lastPlayingMs = 0;
   let pausedHold = false;
   let compareActive = false;
+  // Set from the native host's ping: in a Vulkan-enhanced browser the injected DOM panel
+  // would be enhanced, duplicated by compare, and covered by the composition overlay.
+  let nativePanelMode = false;
+  let nativeShown = false;
+  // A tab does nothing until the toolbar icon (or Alt+Shift+D) arms it. This is the browser-side
+  // equivalent of Chrome's "On click" site access: no reports, no ROI, no auto profile, no panel
+  // on pages the user never clicked on (Amazon, shopping sites, news, ...).
+  let activated = false;
 
   const attachPanel = (manual) => {
     if (manual) manualPinned = true;
     userHidden = false;
+    if (nativePanelMode) {
+      if (!nativeShown) { nativeShown = true; send({ cmd: 'panel.show' }); }
+      return;
+    }
     if (!panelAttached) {
       (document.fullscreenElement || document.documentElement).appendChild(panel);
       panelAttached = true;
@@ -207,20 +221,42 @@
     refreshProfiles(); refreshHelper();
   };
   const detachPanel = () => {
+    if (nativePanelMode) {
+      if (nativeShown) { nativeShown = false; send({ cmd: 'panel.hide' }); }
+      return;
+    }
     if (panelAttached) panel.remove();
     panelAttached = false;
   };
 
+  // Disarm this tab: stop reporting, release the frozen compare frame and close the panel.
+  // The background does the same for the tab set when it gets tab_deactivated, and turns the pass
+  // off if no other armed tab is playing video.
+  const deactivate = () => {
+    activated = false;
+    userHidden = true;
+    manualPinned = false;
+    if (pausedHold) {
+      pausedHold = false;
+      send({ cmd: 'set', key: 'hold', value: 0 });
+      send({ cmd: 'pause_hold', active: false });
+    }
+    detachPanel();
+  };
+
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && (msg.cmd === 'toggle_panel' || msg.cmd === 'show_panel')) {
-      if (panelAttached && panel.style.display === 'block' && msg.cmd === 'toggle_panel') {
-        detachPanel();
-        userHidden = true;
-        manualPinned = false;
-      } else {
-        attachPanel(true);
-        refresh();
-      }
+    // The background sends activate/deactivate when the toolbar icon (or shortcut) is used.
+    // show_panel/toggle_panel are kept as aliases: dlssnr_panel.py pins its web view open with
+    // show_panel on load, and older callers may still use toggle_panel.
+    if (msg && (msg.cmd === 'activate' || msg.cmd === 'show_panel' || msg.cmd === 'toggle_panel')) {
+      activated = true;
+      userHidden = false;
+      // Ping first so nativePanelMode is known before attachPanel decides where the panel lives.
+      refresh();
+      return;
+    }
+    if (msg && (msg.cmd === 'deactivate' || msg.cmd === 'hide_panel')) {
+      deactivate();
     }
   });
 
@@ -236,10 +272,18 @@
   };
 
   $('dlss5-close').addEventListener('click', () => {
-    detachPanel();
-    userHidden = true;
-    manualPinned = false;
+    deactivate();
+    send({ cmd: 'tab_deactivated' });   // let background drop this tab from its armed set
   });
+  // Gear opens the auto-site allowlist editor (extension options). The native GTK panel's chrome
+  // shim has no openOptionsPage, so hide it there rather than leaving a dead button.
+  const optionsBtn = $('dlss5-options');
+  if (optionsBtn) {
+    if (chrome.runtime.openOptionsPage)
+      optionsBtn.addEventListener('click', () => chrome.runtime.openOptionsPage());
+    else
+      optionsBtn.style.display = 'none';
+  }
   const head = $('dlss5-head');
   let drag = null;
   head.addEventListener('mousedown', (e) => {
@@ -607,6 +651,9 @@
   };
   let tick = 0;
   let staleCount = 0;
+  // Only call a dead layer PID 'stale' if this panel has seen it alive. A fresh browser can
+  // inherit a PID from an old presenter that died; that is simply 'no presenter attached'.
+  let sawLayerAlive = false;
   let restarting = false;
 
   let staleNotified = false;
@@ -618,7 +665,14 @@
   };
 
   async function refresh() {
+    if (!activated) return;               // unarmed tab: no ping, no reports, no ROI, no settings
     try {
+    const probe = await send({ cmd: 'ping' });
+    if (probe && probe.staleContext) { showStaleWarning(); return; }
+    nativePanelMode = !!(probe && probe.nativePanel && probe.enhanced);
+    // An armed tab always shows its panel, with or without a playing video. Visibility of the
+    // panel is tied to the click, not to video detection.
+    if (!userHidden && !panelAttached && !nativeShown) attachPanel(true);
     const sig = videoSig();
     lastVideoSig = sig;
     const s = videoState();
@@ -636,23 +690,20 @@
       send({ cmd: 'pause_hold', active: false });
     }
 
-    // Only create an overlay once a real video is actually playing in this visible tab.
-    if (s.visible && s.playing && !userHidden) {
-      lastPlayingMs = Date.now();
-      if (!panelAttached) attachPanel(false);
-    } else if (pausedHold) {
-      lastPlayingMs = Date.now();
-    } else if (panelAttached && !manualPinned && Date.now() - lastPlayingMs > 3000) {
-      detachPanel();
-    }
+    // Video state now only drives gating in background.js; it must not pop the panel up or tear it
+    // down. The panel lives and dies with the user's click (or the close button).
+    if (s.playing || pausedHold) lastPlayingMs = Date.now();
     // In fullscreen only the fullscreen element is painted; keep the panel inside it.
     if (panelAttached) {
       const wantedParent = document.fullscreenElement || document.documentElement;
       if (panel.parentElement !== wantedParent) wantedParent.appendChild(panel);
     }
-    const probe = await send({ cmd: 'ping' });
-    if (probe && probe.staleContext) { showStaleWarning(); return; }
     reportState();
+    // Auto-profile-by-site is owned by the native host. background.js handles tab_report for
+    // gating; this verb falls through to the native host with the real site URL (over native
+    // messaging in Chrome, over the loopback HTTP daemon in Firefox).
+    send({ cmd: 'browser.tab_report', url: location.href,
+           visible: s.visible, playing: s.playing });
     // Send the ROI straight to the native host too. This keeps the swapchain size accurate even if
     // the background service worker is running a cached copy of its script.
     if (!manualRoi && s.visible && s.playing && s.rect)
@@ -684,10 +735,14 @@
     }
     const st = await send({ cmd: 'status' });
     if (st && st.ok) {
-      const on = st.helper === 4 && st.modelUp === 1;
+      const helperRunning = st.helper === 4;
+      const modelReady = st.modelUp === 1;
+      const on = helperRunning && modelReady;
+      if (st.layerAlive) sawLayerAlive = true;
+      const stale = !st.layerAlive && sawLayerAlive && !!st.layerPid;
       const attached = st.layerAlive ? ' · layer attached to a presenter' :
-                        (st.layerPid ? ' · layer PID is stale (presenter died)' : ' · no layer presenting');
-      if (on && !st.layerAlive && s.playing && s.visible) {
+                        stale ? ' · layer PID is stale (presenter died)' : ' · no presenter attached';
+      if (on && stale && s.playing && s.visible) {
         staleCount++;
         if (autoRestartEnabled && !restarting && staleCount >= 2) {
           restarting = true;
@@ -702,8 +757,18 @@
         }
       } else {
         staleCount = 0;
-        setStatus(on ? `NR running${attached} · ${st.layerFrames} frames · ${st.width}×${st.height}` :
-                       'Helper not running — start it with the DLSS5 Helper app.', !on || !st.layerAlive);
+        if (!helperRunning) {
+          setStatus('Helper not running — start it with the DLSS5 Helper app.', true);
+        } else if (!modelReady) {
+          // helper_state=4 means the helper process is alive; model_up only flips once the layer
+          // has composed a frame. Saying "helper not running" here sent users chasing a process
+          // that was actually fine.
+          setStatus(`Helper running${attached} — model not ready yet; waiting for the first frame.`, false);
+        } else if (st.layerAlive) {
+          setStatus(`NR running${attached} · ${st.layerFrames} frames · ${st.width}×${st.height}`, false);
+        } else {
+          setStatus(`NR ready${attached} — start the DLSS5 Video player to enhance video.`, false);
+        }
       }
     }
     } catch (e) {

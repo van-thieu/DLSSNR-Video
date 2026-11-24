@@ -287,8 +287,12 @@ bool Composition::MakeImage(Image& img, uint32_t w, uint32_t h, VkFormat format,
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
-    if (_vk->vkAllocateMemory(_device, &mai, nullptr, &img.memory) != VK_SUCCESS) {
-        Log("[comp] out of device memory for a %ux%u surface", w, h);
+    VkResult allocResult = _vk->vkAllocateMemory(_device, &mai, nullptr, &img.memory);
+    if (allocResult != VK_SUCCESS) {
+        // The old message said "out of device memory" for every failure, which made an allocation
+        // that failed for budget/heap/driver reasons look like global VRAM exhaustion.
+        Log("[comp] vkAllocateMemory failed for %ux%u (%llu bytes, type %u, heap %u): VkResult %d",
+            w, h, (unsigned long long)req.size, type, mp.memoryTypes[type].heapIndex, (int) allocResult);
         DropImage(img);
         return false;
     }

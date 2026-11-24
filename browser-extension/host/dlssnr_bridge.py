@@ -7,27 +7,53 @@ hands a video URL to the running DLSS5 Video player over a local socket, or laun
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
-import asyncio
-import urllib.request
-import websockets
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 UID = os.getuid()
-SHM = os.environ.get("DLSSNR_SHM", f"/tmp/dlssnr-video-{UID}/shm.bin")
-SHMCTL = os.path.expanduser("~/.local/bin/dlssnr-video-shmctl")
-HELPER_CLI = os.path.expanduser("~/.local/bin/dlssnr-video-helper")
-PLAYER = os.path.expanduser("~/.local/bin/dlssnr-gui-video")
-APP_SOCK = f"/tmp/dlssnr-video/app-{UID}.sock"
-SUPPRESS_FILE = f"/tmp/dlssnr-video/suppress-until-{UID}"
-RESTART_FLAG = f"/tmp/dlssnr-video/last-restart-{UID}"
+# A confined browser rewrites ~ to its snap home. Always resolve project paths against the real
+# user home (overridable with DLSSNR_HOME) so the native host finds the same tools and config.
+HOME_DIR = os.environ.get("DLSSNR_HOME", "/home/vthieu")
+# tempfile.gettempdir() honours TMPDIR. The Firefox snap has a private /tmp, so its wrapper points
+# TMPDIR at a shared, non-hidden directory that the browser, native host, player and panel all see.
+TMP = tempfile.gettempdir()
+RUNTIME = os.path.join(TMP, "dlssnr-video")
+SHM = os.environ.get("DLSSNR_SHM", os.path.join(os.environ.get("DLSSNR_RUNTIME_DIR", os.path.join(HOME_DIR, "dlssnr-runtime")), "shm.bin"))
+SHMCTL = os.path.join(HOME_DIR, ".local/bin/dlssnr-video-shmctl")
+HELPER_CLI = os.path.join(HOME_DIR, ".local/bin/dlssnr-video-helper")
+PLAYER = os.path.join(HOME_DIR, ".local/bin/dlssnr-gui-video")
+APP_SOCK = os.path.join(RUNTIME, f"app-{UID}.sock")
+PANEL_SOCK = os.path.join(RUNTIME, f"panel-{UID}.sock")
+PANEL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dlssnr_panel.py")
+SUPPRESS_FILE = os.path.join(RUNTIME, f"suppress-until-{UID}")
+RESTART_FLAG = os.path.join(RUNTIME, f"last-restart-{UID}")
+BRIDGE_LOG = os.path.join(TMP, "dlssnr-bridge.log")
+ROI_LOG = os.path.join(TMP, "dlssnr-roi.log")
 CHROME_CDP = "http://127.0.0.1:9222/json/version"
 # Video profiles are deliberately separate from the desktop helper's game profiles. Removing or
 # renaming a profile from the browser must never touch a game profile.
-PROFILE_DIR = os.path.expanduser("~/.config/dlssnr-video/dlssnr/profiles")
-VIDEO_CONFIG = os.path.expanduser("~/.config/dlssnr-video/dlssnr/config.ini")
+PROFILE_DIR = os.path.join(HOME_DIR, ".config/dlssnr-video/dlssnr/profiles")
+VIDEO_CONFIG = os.path.join(HOME_DIR, ".config/dlssnr-video/dlssnr/config.ini")
+# Shared across the Chrome host, the daemon and the native panel process: each has its own
+# active_url global, but restart must reopen the page the user was watching.
+LAST_URL_FILE = os.path.join(HOME_DIR, ".config/dlssnr-video/dlssnr/last-url")
+
+# Auto-profile-by-site used to live only in background.js. With the in-page panel gone in an
+# enhanced browser, the native host owns it: both the browser's content script and the native panel
+# send their verbs here, so there is one source of truth.
+AUTO_STATE = os.path.join(HOME_DIR, ".config/dlssnr-video/dlssnr/auto-profiles.json")
+HOST_NOISE = {"www", "com", "co", "net", "org", "tv", "cn", "ca", "io", "app", "m"}
+active_url = ""
+_auto_state = None
+_last_auto_host = ""
+_last_auto_profile = ""
 
 # shmctl setting name -> the set_* key used by dlssnr_gui profile files.
 PROFILE_KEYS = {
@@ -54,24 +80,136 @@ PROFILE_KEYS = {
 KEY_TO_SHM = {v: k for k, v in PROFILE_KEYS.items()}
 
 
-def read_msg():
-    raw = sys.stdin.buffer.read(4)
+def host_of(url):
+    try:
+        h = (urlparse(str(url or "")).hostname or "").lower()
+        return re.sub(r"^www\.", "", h)
+    except Exception:
+        return ""
+
+
+def norm_name(s):
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def load_auto_state():
+    global _auto_state
+    if _auto_state is None:
+        try:
+            with open(AUTO_STATE) as f:
+                _auto_state = json.load(f)
+        except Exception:
+            _auto_state = {}
+        _auto_state.setdefault("enabled", True)
+        _auto_state.setdefault("sites", {})
+    return _auto_state
+
+
+def save_auto_state():
+    try:
+        os.makedirs(os.path.dirname(AUTO_STATE), exist_ok=True)
+        with open(AUTO_STATE, "w") as f:
+            json.dump(load_auto_state(), f, indent=2)
+    except Exception:
+        pass
+
+
+def list_profile_names():
+    try:
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        return sorted(f[:-4] for f in os.listdir(PROFILE_DIR)
+                      if f.lower().endswith(".ini") and os.path.isfile(os.path.join(PROFILE_DIR, f)))
+    except Exception:
+        return []
+
+
+def apply_profile_file(name):
+    """Load a video profile into the shared header. Returns (ok, name-or-error)."""
+    try:
+        path = os.path.basename(str(name)).strip()
+        if not path.lower().endswith(".ini"):
+            path += ".ini"
+        values = {}
+        with open(os.path.join(PROFILE_DIR, path)) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                shm = KEY_TO_SHM.get(k.strip())
+                if not shm:
+                    continue
+                raw = v.strip()
+                if shm == "bypass":
+                    raw = str(0 if int(float(raw)) else 1)   # GUI stores the inverse
+                values[shm] = raw
+        for shm, value in values.items():
+            ok, text = shmctl("set", shm, value)
+            if not ok:
+                return False, text
+        remember_profile(path[:-4])
+        return True, path[:-4]
+    except Exception as e:
+        return False, str(e)
+
+
+def infer_profile(host, profiles):
+    if not host:
+        return ""
+    tokens = [x for x in host.split(".") if x and x not in HOST_NOISE]
+    full = "".join(tokens)
+    for p in profiles:
+        n = norm_name(p)
+        if not n:
+            continue
+        if full in n or n in full:
+            return p
+        for x in tokens:
+            if len(x) >= 3 and (x in n or n in x):
+                return p
+    return ""
+
+
+def apply_auto_profile(force=False):
+    global _last_auto_host, _last_auto_profile
+    st = load_auto_state()
+    if not st.get("enabled"):
+        return
+    host = host_of(active_url)
+    if not host:
+        return
+    if host == _last_auto_host and not force:
+        return
+    _last_auto_host = host
+    name = st.get("sites", {}).get(host) or infer_profile(host, list_profile_names())
+    if not name:
+        _last_auto_profile = ""
+        return
+    ok, _ = apply_profile_file(name)
+    if ok:
+        _last_auto_profile = name
+
+
+def read_msg(f=None):
+    f = f or sys.stdin.buffer
+    raw = f.read(4)
     if len(raw) < 4:
         return None
     n = int.from_bytes(raw, "little")
     data = b""
     while len(data) < n:
-        chunk = sys.stdin.buffer.read(n - len(data))
+        chunk = f.read(n - len(data))
         if not chunk:
             return None
         data += chunk
     return json.loads(data.decode("utf-8"))
 
 
-def send_msg(obj):
+def send_msg(obj, f=None):
+    f = f or sys.stdout.buffer
     data = json.dumps(obj).encode("utf-8")
-    sys.stdout.buffer.write(len(data).to_bytes(4, "little") + data)
-    sys.stdout.buffer.flush()
+    f.write(len(data).to_bytes(4, "little") + data)
+    f.flush()
 
 
 def shmctl(*args):
@@ -103,8 +241,19 @@ def remember_profile(name):
         pass
 
 
+def browser_kind():
+    """Explicit wrapper hint wins; otherwise infer from the running browser's profile path."""
+    hint = os.environ.get("DLSSNR_BROWSER", "").lower()
+    return hint if hint in ("chrome", "firefox") else running_browser()
+
+
 def chrome_ready():
-    """Check that Chrome's GPU process is up with our layer loaded and the helper is ready."""
+    """Check that the browser presenter is up with our layer loaded and the helper is ready.
+
+    Firefox on Linux normally composites through WebRender/OpenGL and never maps the Vulkan layer
+    into its GPU process. Waiting for that would keep auto-NR permanently off, so for Firefox we
+    accept the shared-memory layer presenter (the desktop player) as the readiness signal.
+    """
     reasons = []
     ok, text = shmctl("status")
     if not ok:
@@ -114,13 +263,17 @@ def chrome_ready():
         reasons.append("shm version mismatch")
     if int(s.get("helper_state", 0)) != 4:
         reasons.append("helper not running")
-    if int(s.get("model_up", 0)) != 1:
-        reasons.append("model not ready")
-    pid = int(s.get("layer_pid", 0))
-    if not pid or not os.path.isdir(f"/proc/{pid}"):
-        reasons.append("layer presenter not alive")
+    # model_up and layer_pid are *results* of composing a frame, not prerequisites for enabling the
+    # pass. After a helper restart both stay at zero, so requiring them here deadlocked the whole
+    # pipeline: the extension refused to set enabled=1, the layer never composed, model_up never
+    # became 1. They are still reported by the `status` verb (and shown in the panel); just don't
+    # gate readiness on them.
 
-    # Find the video-profile GPU process and confirm the video layer is mapped into it.
+    if browser_kind() == "firefox":
+        # Firefox's own compositor is not Vulkan; layer_pid is the desktop player's presenter.
+        return not reasons, reasons
+
+    # Chrome: find a GPU process with the video layer mapped before enabling the pass.
     gpu_ok = False
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -129,14 +282,15 @@ def chrome_ready():
             cmd = open(f"/proc/{entry}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "ignore")
         except Exception:
             continue
-        if "--type=gpu-process" not in cmd or "chrome-video-profile" not in cmd:
+        if "--type=gpu-process" not in cmd:
             continue
         try:
             maps = open(f"/proc/{entry}/maps", "rb").read().decode("utf-8", "ignore")
             gpu_ok = "libVkLayer_NV_dlssnr" in maps or "VK_LAYER_NV_dlssnr_video" in maps
         except Exception:
             gpu_ok = False
-        break
+        if gpu_ok:
+            break
     if not gpu_ok:
         reasons.append("GPU process not ready with video layer")
     return not reasons, reasons
@@ -154,42 +308,207 @@ def helper_ctl(action, timeout=30):
         return False, str(e)
 
 
-def restart_chrome(url):
-    # Reliable full restart: a detached script kills every Chrome process using the video profile
-    # (Browser.close is unreliable when DevTools is gone) and then relaunches via the wrapper.
+def panel_ctl(action, launch=True):
+    """Send show/hide/toggle to the native control panel, starting it on demand.
+
+    The panel is a separate GTK/WebKit window, so it is never part of the browser's Vulkan
+    swapchain and the layer cannot enhance it or duplicate it in compare mode.
+    """
+    def try_connect():
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect(PANEL_SOCK)
+            s.sendall((action + "\n").encode("utf-8"))
+            s.close()
+            return True
+        except OSError:
+            return False
+
+    if try_connect():
+        return True, ""
+    if launch and action in ("show", "toggle") and os.path.isfile(PANEL_SCRIPT):
+        env = os.environ.copy()
+        # Never let the panel toolchain inherit the layer: it must paint its own X11 surface.
+        for key in ("VKLayer_DLSS5", "VK_INSTANCE_LAYERS", "VK_LOADER_DEBUG"):
+            env.pop(key, None)
+        try:
+            os.makedirs("/tmp/opencode", exist_ok=True)
+            log = open("/tmp/opencode/dlss5-panel.log", "a")
+            subprocess.Popen([sys.executable, PANEL_SCRIPT], env=env,
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        except Exception as e:
+            return False, str(e)
+        for _ in range(20):
+            time.sleep(0.25)
+            if try_connect():
+                return True, ""
+    return False, "native panel not running"
+
+
+def running_browser():
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            cmd = open(f"/proc/{entry}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if any(k in cmd for k in ("dlss5-firefox-profile", "firefox-video-profile")):
+            return "firefox"
+        if "chrome-video-profile" in cmd:
+            return "chrome"
+    return "chrome"
+
+
+def restart_browser(url):
+    """Full browser restart via the matching wrapper, with a detached kill/relaunch script."""
     try:
         last = float(open(RESTART_FLAG).read().strip())
-        if time.time() - last < 90:
-            return False, "restart throttled (90s cooldown)"
+        if time.time() - last < 5:
+            return False, "restart throttled (5s cooldown)"
     except Exception:
         pass
     with open(RESTART_FLAG, "w") as f:
         f.write(str(time.time()))
-    os.makedirs(f"/tmp/dlssnr-video", exist_ok=True)
-    script = f"/tmp/dlssnr-video/restart-{UID}.sh"
+    browser = browser_kind()
+    profile = "dlss5-firefox-profile" if browser == "firefox" else "chrome-video-profile"
+    wrapper = ("/home/vthieu/.local/bin/dlss5-firefox" if browser == "firefox"
+               else "/home/vthieu/.local/bin/dlss5-chrome")
+    os.makedirs(RUNTIME, exist_ok=True)
+    script = os.path.join(RUNTIME, f"restart-{UID}.sh")
     safe = str(url).replace("'", "'\\''") if url else "about:blank"
     with open(script, "w") as f:
         f.write("#!/bin/bash\n")
-        f.write("pkill -TERM -f 'chrome-video-profile' 2>/dev/null || true\n")
+        f.write(f"pkill -TERM -f '{profile}' 2>/dev/null || true\n")
         f.write("sleep 4\n")
-        f.write("pkill -KILL -f 'chrome-video-profile' 2>/dev/null || true\n")
+        f.write(f"pkill -KILL -f '{profile}' 2>/dev/null || true\n")
         f.write("sleep 1\n")
-        f.write("nohup /home/vthieu/.local/bin/dlss5-chrome '" + safe +
-                "' > /tmp/opencode/dlss5-restart.log 2>&1 &\n")
+        f.write(f"nohup {wrapper} '" + safe + "' > /tmp/opencode/dlss5-restart.log 2>&1 &\n")
     os.chmod(script, 0o755)
     subprocess.Popen(["setsid", "bash", script],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
-    return True, "chrome restart initiated"
+    return True, f"{browser} restart initiated"
+
+
+def play_video(url):
+    """Send a video URL to the running DLSS5 player, or launch it with that URL."""
+    url = str(url or "").strip()
+    if not url or url.startswith("http://127.0.0.1:") or url.startswith("http://localhost:"):
+        return {"ok": False, "error": "no usable video URL (the native panel is on localhost)"}
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(APP_SOCK)
+        s.sendall(url.encode("utf-8"))
+        s.close()
+        return {"ok": True, "launched": False}
+    except OSError:
+        pass
+    try:
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
+        subprocess.Popen([PLAYER, "--video", url], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": True, "launched": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def handle(msg):
+    global active_url, _last_auto_host, _last_auto_profile
     cmd = msg.get("cmd", "")
-    with open("/tmp/dlssnr-bridge.log", "a") as _log:
+    with open(BRIDGE_LOG, "a") as _log:
         _log.write(json.dumps({"t": round(time.time(), 2), "cmd": cmd,
                                "key": msg.get("key"), "value": msg.get("value")}) + "\n")
-    if cmd == "chrome.restart":
-        ok, text = restart_chrome(msg.get("url", ""))
+    # Auto-profile-by-site. The native panel's own tab_report has a localhost URL; only a real
+    # site reported by the browser's content script may become the active host.
+    if cmd in ("tab_report", "browser.tab_report"):
+        url = str(msg.get("url") or "")
+        if host_of(url) in ("127.0.0.1", "localhost"):
+            url = ""
+        if url and (msg.get("playing") or msg.get("visible")):
+            active_url = url
+            try:
+                with open(LAST_URL_FILE, "w") as f:
+                    f.write(url)
+            except Exception:
+                pass
+            apply_auto_profile()
+        return {"ok": True}
+    if cmd == "auto_profile_get":
+        st = load_auto_state()
+        host = host_of(active_url)
+        return {"ok": True, "enabled": bool(st.get("enabled")), "host": host,
+                "profile": st.get("sites", {}).get(host) or _last_auto_profile or ""}
+    if cmd == "auto_profile_set":
+        st = load_auto_state()
+        st["enabled"] = bool(msg.get("enabled"))
+        save_auto_state()
+        _last_auto_host = ""
+        apply_auto_profile()
+        return {"ok": True, "enabled": st["enabled"]}
+    if cmd == "auto_profile_import":
+        # One-time migration of per-site choices stored by the old background-script logic. Only
+        # fill gaps: the native panel's state file is authoritative once the user has used it.
+        st = load_auto_state()
+        for h, n in (msg.get("sites") or {}).items():
+            if h and n:
+                st.setdefault("sites", {}).setdefault(h, n)
+        save_auto_state()
+        return {"ok": True}
+    if cmd == "profile_manual":
+        host = host_of(msg.get("url"))
+        if not host or host in ("127.0.0.1", "localhost"):
+            host = host_of(active_url)   # the native panel is on localhost
+        name = str(msg.get("name") or "")
+        if host and name:
+            st = load_auto_state()
+            st.setdefault("sites", {})[host] = name
+            save_auto_state()
+            _last_auto_host, _last_auto_profile = host, name
+        return {"ok": True, "host": host}
+    if cmd == "profile_renamed":
+        st = load_auto_state()
+        for h, n in list(st.get("sites", {}).items()):
+            if n == msg.get("oldName"):
+                st["sites"][h] = msg.get("newName")
+        if _last_auto_profile == msg.get("oldName"):
+            _last_auto_profile = msg.get("newName")
+        save_auto_state()
+        return {"ok": True}
+    if cmd == "profile_removed":
+        st = load_auto_state()
+        for h, n in list(st.get("sites", {}).items()):
+            if n == msg.get("name"):
+                del st["sites"][h]
+        if _last_auto_profile == msg.get("name"):
+            _last_auto_profile = ""
+        save_auto_state()
+        return {"ok": True}
+
+    if cmd in ("panel.show", "panel.hide", "panel.toggle", "panel.status"):
+        action = cmd.split(".", 1)[1]
+        ok, text = panel_ctl(action)
+        return {"ok": ok, "text": text}
+    if cmd == "pause_hold":
+        # The content script already sets `hold` itself; accept the verb so an enhanced browser's
+        # paused-compare path stays quiet instead of reporting "unknown command".
+        return {"ok": True}
+    if cmd in ("chrome.restart", "browser.restart"):
+        url = str(msg.get("url") or "")
+        if host_of(url) in ("127.0.0.1", "localhost"):
+            # The native panel lives on localhost, so its location.href is useless. Read the page
+            # URL shared by whichever bridge instance last saw the browser tab.
+            url = active_url
+            if not url:
+                try:
+                    url = open(LAST_URL_FILE).read().strip()
+                except Exception:
+                    pass
+        ok, text = restart_browser(url)
         return {"ok": ok, "text": text}
     if cmd == "chrome.ready":
         ready, reasons = chrome_ready()
@@ -208,7 +527,11 @@ def handle(msg):
         return {"ok": ok, "text": text}
 
     if cmd == "ping":
-        return {"ok": True, "version": 1, "shm": SHM}
+        # VKLayer_DLSS5 is inherited from the (enhanced) browser process, so the content script can
+        # tell that its injected DOM panel would be enhanced/duplicated and use the native one.
+        return {"ok": True, "version": 1, "shm": SHM,
+                "nativePanel": os.path.isfile(PANEL_SCRIPT),
+                "enhanced": bool(os.environ.get("VKLayer_DLSS5"))}
 
     if cmd == "status":
         ok, text = shmctl("status")
@@ -266,7 +589,7 @@ def handle(msg):
         return {"ok": ok, "error": None if ok else text}
 
     if cmd == "roi":
-        with open("/tmp/dlssnr-roi.log", "a") as _log:
+        with open(ROI_LOG, "a") as _log:
             _log.write(json.dumps({"t": round(time.time(), 2), **msg}) + "\n")
         rect = msg.get("rect") or {}
         try:
@@ -399,40 +722,23 @@ def handle(msg):
         return {"ok": True, "applied": list(tuned)}
 
     if cmd == "play":
-        url = str(msg.get("url", "")).strip()
-        if not url:
-            return {"ok": False, "error": "empty url"}
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(2)
-            s.connect(APP_SOCK)
-            s.sendall(url.encode("utf-8"))
-            s.close()
-            return {"ok": True, "launched": False}
-        except OSError:
-            pass
-        try:
-            env = os.environ.copy()
-            env.setdefault("DISPLAY", ":0")
-            subprocess.Popen([PLAYER, "--video", url], env=env,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return {"ok": True, "launched": True}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return play_video(msg.get("url"))
 
     return {"ok": False, "error": f"unknown command {cmd}"}
 
 
-def main():
+def serve_conn(rf, wf=None):
+    """Answer native-messaging frames from one client (stdin or a proxy socket)."""
+    wf = wf or sys.stdout.buffer
     while True:
         try:
-            msg = read_msg()
+            msg = read_msg(rf)
         except Exception:
             return
         if msg is None:
             return
         try:
-            with open("/tmp/dlssnr-bridge.log", "a") as log:
+            with open(BRIDGE_LOG, "a") as log:
                 log.write(json.dumps({"cmd": msg.get("cmd"), "id": msg.get("id")}) + "\n")
         except Exception:
             pass
@@ -442,7 +748,78 @@ def main():
             resp = {"ok": False, "error": repr(e)}
         if "id" in msg:
             resp["id"] = msg["id"]
-        send_msg(resp)
+        try:
+            send_msg(resp, wf)
+        except Exception:
+            return
+
+
+def http_server(port=None):
+    """Loopback HTTP transport for confined browsers that cannot use native messaging."""
+    port = int(port or os.environ.get("DLSSNR_BRIDGE_HTTP", "8765"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, code, body):
+            data = json.dumps(body).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_OPTIONS(self):
+            self._reply(200, {"ok": True})
+
+        def do_POST(self):
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                msg = json.loads(self.rfile.read(n).decode("utf-8"))
+                resp = handle(msg)
+                if "id" in msg:
+                    resp["id"] = msg["id"]
+                self._reply(200, resp)
+            except Exception as e:
+                self._reply(200, {"ok": False, "error": repr(e)})
+
+        def log_message(self, *args):
+            pass
+
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+
+
+def server():
+    """Run as a normal (unconfined) daemon. A confined browser connects through a proxy or HTTP."""
+    threading.Thread(target=http_server, daemon=True).start()
+    path = os.environ.get("DLSSNR_BRIDGE_SOCK", os.path.join(RUNTIME, "bridge.sock"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        os.unlink(path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(8)
+    def handle_conn(conn):
+        try:
+            serve_conn(conn.makefile("rb"), conn.makefile("wb"))
+        finally:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            conn.close()
+
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle_conn, args=(conn,), daemon=True).start()
+
+
+def main():
+    if "--server" in sys.argv:
+        server()
+        return
+    serve_conn(sys.stdin.buffer)
 
 
 if __name__ == "__main__":

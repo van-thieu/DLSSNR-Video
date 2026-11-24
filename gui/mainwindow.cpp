@@ -638,6 +638,15 @@ QString MainWindow::findHelperCli() const {
     const QString env = qEnvironmentVariable("DLSSNR_HELPER_CLI");
     if (!env.isEmpty() && QFile::exists(env)) return env;
 
+    // The video window must control the video helper: the game helper uses a different config,
+    // prefix and SHM, so Start/Stop would silently act on the wrong process.
+    if (videoMode) {
+        const QString video = QStandardPaths::findExecutable("dlssnr-video-helper");
+        if (!video.isEmpty()) return video;
+        const QString localVideo = QDir::homePath() + "/.local/bin/dlssnr-video-helper";
+        if (QFile::exists(localVideo)) return localVideo;
+    }
+
     const QString found = QStandardPaths::findExecutable("dlssnr-helper");
     if (!found.isEmpty()) return found;
 
